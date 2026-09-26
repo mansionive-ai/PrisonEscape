@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>방탈출</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: system-ui, -apple-system, Roboto, 'Noto Sans KR', sans-serif;
+    background: linear-gradient(120deg, #0f172a, #0b1220); color: #fff;
+  }
+  #stage {
+    min-height: 100%; box-sizing: border-box; padding: 3.5rem 1rem 2rem;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; user-select: none; -webkit-user-select: none; cursor: default;
+  }
+  #card { max-width: 640px; width: 100%; }
+  .scene { max-width: min(320px, 80vw); max-height: 50vh; object-fit: contain; border-radius: 8px; margin-bottom: 1.5rem; -webkit-user-drag: none; }
+  .title-img { max-width: min(350px, 85vw); }
+  .text { font-size: 1.1rem; line-height: 1.8; margin: 0; }
+  .warn { color: #ef4444; margin-top: 1rem; }
+  button { font: inherit; border: 0; border-radius: 6px; color: #fff; cursor: pointer; padding: .75rem 1.5rem; }
+  #back { position: fixed; top: 6px; left: 6px; z-index: 10; background: rgba(51,65,85,.8); font-size: 18px; padding: 8px 16px; }
+  .choices { margin-top: 1.5rem; display: flex; flex-direction: column; align-items: center; gap: .75rem; }
+  .choices button { background: #6366f1; min-width: min(260px, 80vw); }
+  .choices button:hover { background: #4f46e5; }
+  form { margin-top: 1.25rem; display: flex; flex-direction: column; align-items: center; gap: .5rem; }
+  input { font: inherit; padding: .75rem; width: min(240px, 80vw); text-align: center; color: #fff;
+          background: #1e293b; border: 2px solid #475569; border-radius: 6px; user-select: text; }
+  input:focus { outline: none; border-color: #3b82f6; }
+  form button { background: #10b981; }
+  .msg { min-height: 1.4em; margin: 0; color: #ef4444; font-weight: bold; }
+  #newGame { background: #3b82f6; margin-top: 1rem; }
+  #confirm { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: flex; align-items: center; justify-content: center; z-index: 20; }
+  #confirm[hidden] { display: none; }
+  #confirm > div { background: #1e293b; padding: 30px; border-radius: 12px; text-align: center; }
+  #yes { background: #ef4444; margin-right: 10px; } #no { background: #6b7280; }
+</style>
+</head>
+<body>
+<button id="back" hidden>←</button>
+<main id="stage"><div id="card"><p class="text">불러오는 중…</p></div></main>
+<div id="confirm" hidden><div>
+  <p>이어하기가 존재합니다.<br>정말로 새로 시작합니까?</p>
+  <button id="yes">네</button><button id="no">아니요</button>
+</div></div>
+<audio id="bgm" loop></audio><audio id="sfx"></audio>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-app.js";
+import { getDatabase, ref, get } from "https://www.gstatic.com/firebasejs/12.7.0/firebase-database.js";
+import { GAME, normalizeAnswer } from "./config.js";
+
+// 이 파일에는 스토리·정답·이미지 경로가 하나도 없습니다.
+// 페이지는 정답을 맞혀야만 DB에서 받아올 수 있습니다.
+const db = getDatabase(initializeApp(GAME.firebase));
+const $ = (id) => document.getElementById(id);
+const card = $("card"), backBtn = $("back"), bgm = $("bgm"), sfx = $("sfx");
+
+const pages = new Map();   // 지금까지 해금된 페이지만 들어있음
+const lockGoto = new Map(); // 푼 잠금 → 이동할 페이지
+let first = null, started = false;
+let S = fresh();
+
+function fresh() { return { page: null, history: [], name: "", solved: {}, bgm: "" }; }
+function save() { try { localStorage.setItem(GAME.saveKey, JSON.stringify(S)); } catch {} }
+function readSave() {
+  try { const s = JSON.parse(localStorage.getItem(GAME.saveKey)); return s && s.page ? { ...fresh(), ...s } : null; }
+  catch { return null; }
+}
+
+// ---------- DB ----------
+async function fetchBundle(key) {
+  if (!/^(start|[0-9a-f]{64})$/.test(key)) return null;
+  try { const snap = await get(ref(db, "k/" + key)); return snap.exists() ? snap.val() : null; }
+  catch (e) { console.warn(e); return null; }
+}
+function addBundle(b) {
+  for (const p of b.pages || []) pages.set(String(p.id), p);
+  if (b.lock != null) lockGoto.set(String(b.lock), String(b.goto));
+}
+async function answerKey(lockId, answer) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(normalizeAnswer(answer)), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt: enc.encode(`${GAME.salt}:${lockId}`), iterations: GAME.iterations }, key, 256);
+  return [...new Uint8Array(bits)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ---------- 이동 ----------
+function go(id, push = true) {
+  id = String(id);
+  if (!pages.has(id)) return;
+  if (push && S.page != null) S.history.push(S.page);
+  S.page = id; save(); render();
+}
+function back() {
+  while (S.history.length) {
+    const id = S.history.pop();
+    if (pages.has(id)) { S.page = id; save(); render(); return; }
+  }
+}
+function nextOf(id, p) {
+  const n = p.next != null ? String(p.next) : (/^\d+$/.test(id) ? String(+id + 1) : null);
+  return n && pages.has(n) ? n : null;
+}
+function advance() {
+  const p = pages.get(S.page);
+  if (!p || p.choices || p.input) return;
+  if (p.lock) return back();          // 잠금 화면에서 바깥 클릭 = 뒤로
+  const n = nextOf(S.page, p);
+  if (n) go(n);
+}
+
+// ---------- 화면 ----------
+const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
+const esc = (s) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+const fill = (t) => String(t ?? "").replaceAll("[name]", esc(S.name));
+
+function image(src, cls, style) {
+  const img = new Image();
+  img.src = src; img.className = cls; img.draggable = false;
+  if (style) img.style.cssText = style;
+  img.onerror = () => img.remove();
+  return img;
+}
+
+function playAudio(p) {
+  if (p.bgm && p.bgm !== S.bgm) {
+    S.bgm = p.bgm;
+    if (p.bgm === "none") bgm.pause();
+    else { bgm.src = p.bgm; bgm.play().catch(() => {}); }
+  }
+  if (p.sfx) { sfx.src = p.sfx; sfx.play().catch(() => {}); }
+}
+
+function render(depth = 0) {
+  const id = S.page, p = pages.get(id);
+  if (!p) return;
+  if (p.lock && lockGoto.has(id) && depth < 5) {   // 이미 푼 잠금은 건너뜀
+    S.page = lockGoto.get(id); save(); return render(depth + 1);
+  }
+  backBtn.hidden = S.history.length === 0;
+  playAudio(p);
+  card.replaceChildren();
+  if (p.img) card.append(image(p.img, "scene", p.imgStyle));
+  const text = el("p", "text", fill(p.text));
+  if (p.style) text.style.cssText = p.style;
+  card.append(text);
+
+  if (p.choices) {
+    const box = el("div", "choices");
+    for (const c of p.choices) {
+      const b = el("button", null, fill(c.text));
+      b.onclick = () => go(c.goto);
+      box.append(b);
+    }
+    card.append(box);
+  } else if (p.lock) {
+    card.append(form("코드 입력 혹은 아이템 사용", 40, async (v, msg, btn) => {
+      if (!normalizeAnswer(v)) return false;
+      btn.disabled = true; msg.textContent = "확인 중…";
+      const key = await answerKey(id, v);
+      const b = await fetchBundle(key);
+      if (S.page !== id) return true;
+      btn.disabled = false;
+      if (!b) { msg.textContent = "코드가 틀렸습니다!"; return false; }
+      addBundle(b); S.solved[id] = key;
+      go(b.goto, false);
+      return true;
+    }));
+  } else if (p.input === "name") {
+    card.append(form("이름 입력", 10, (v, msg) => {
+      v = v.trim();
+      if (!v) { msg.textContent = "이름을 입력해주세요!"; return false; }
+      S.name = v; go(nextOf(id, p));
+      return true;
+    }));
+  }
+}
+
+function form(placeholder, max, onSubmit) {
+  const f = el("form"), input = el("input"), btn = el("button", null, "확인"), msg = el("p", "msg");
+  input.placeholder = placeholder; input.maxLength = max; input.autocomplete = "off";
+  f.append(input, btn, msg);
+  f.onsubmit = async (e) => {
+    e.preventDefault();
+    const ok = await onSubmit(input.value, msg, btn);
+    if (!ok) { input.value = ""; input.focus(); }
+  };
+  setTimeout(() => input.focus(), 50);
+  return f;
+}
+
+function titleScreen() {
+  backBtn.hidden = true;
+  card.replaceChildren(image(GAME.titleImage, "scene title-img"), el("p", "text", "클릭하여 시작"), el("p", "text warn", GAME.warning));
+  if (readSave()) {
+    const b = el("button", null, "처음부터 하기"); b.id = "newGame";
+    b.onclick = () => ($("confirm").hidden = false);
+    card.append(b);
+  }
+}
+
+// ---------- 시작 / 이어하기 ----------
+async function start(newGame = false) {
+  started = true;
+  const saved = newGame ? null : readSave();
+  if (saved) {
+    const results = await Promise.all(Object.entries(saved.solved || {}).map(async ([lock, key]) => [lock, key, await fetchBundle(key)]));
+    saved.solved = {};
+    for (const [lock, key, b] of results) if (b) { addBundle(b); saved.solved[lock] = key; }  // 위조된 키는 버려짐
+    saved.history = (saved.history || []).map(String).filter((h) => pages.has(h));
+    S = saved;
+    if (!pages.has(String(S.page))) S.page = first;
+    S.page = String(S.page);
+    if (S.bgm && S.bgm !== "none") { bgm.src = S.bgm; bgm.play().catch(() => {}); }
+  } else {
+    S = fresh(); S.page = first;
+  }
+  save(); render();
+}
+
+$("yes").onclick = (e) => { e.stopPropagation(); $("confirm").hidden = true; try { localStorage.removeItem(GAME.saveKey); } catch {} start(true); };
+$("no").onclick = (e) => { e.stopPropagation(); $("confirm").hidden = true; };
+backBtn.onclick = back;
+
+$("stage").addEventListener("click", (e) => {
+  if (e.target.closest("button, input, form") || first == null) return;
+  if (!started) start(); else advance();
+});
+document.addEventListener("keydown", (e) => {
+  if (!started || e.target.matches("input")) return;
+  if (e.key === "ArrowLeft") back();
+  else if (e.key === "ArrowRight" || e.key === " ") { e.preventDefault(); advance(); }
+});
+document.addEventListener("contextmenu", (e) => { if (e.target.tagName === "IMG") e.preventDefault(); });
+
+const startBundle = await fetchBundle("start");
+if (!startBundle) card.innerHTML = '<p class="text warn">서버에 연결할 수 없습니다.</p>';
+else { addBundle(startBundle); first = String(startBundle.first); titleScreen(); }
+</script>
+</body>
+</html>
